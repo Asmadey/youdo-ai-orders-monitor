@@ -1,0 +1,42 @@
+# ======================
+# Python
+# ======================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ======================
+# Virtual environments
+# ======================
+.venv/
+venv/
+env/
+
+# ======================
+# Runtime data
+# ======================
+*.jsonl
+*.json
+youdo_seen_ids.json
+youdo_orders.jsonl
+youdo_error_alerts.json
+
+# ======================
+# Secrets
+# ======================
+.env
+
+# ======================
+# Debug / logs
+# ======================
+debug/
+*.log
+logs/
+
+# ======================
+# OS / IDE
+# ======================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

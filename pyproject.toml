@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "youdo-ai-orders-monitor"
+version = "0.1.0"
+description = "Automated Youdo.com AI order monitoring via mobile API signature replay"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "requests",
+    "python-dotenv",
+]
+
+[project.scripts]
+youdo-check = "youdo_check:main"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
