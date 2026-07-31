@@ -1,230 +1,97 @@
-# Youdo AI Orders Monitor
+# Youdo.com AI Orders Monitor
 
-Мониторинг новых заказов в категории «Разработка ПО» на Youdo.com с фильтрацией по AI-ключевикам, дедупликацией и отправкой уведомлений в Telegram. Работает через replay сигнатуры мобильного API (KeyVersion=1) — без браузера, без логина, без LLM.
+Automated Youdo.com AI order monitoring via mobile API signature replay — fetch, keyword-filter, deduplicate, Telegram notifications with inline cover letter button.
 
-## Возможности
+## How it works
 
-### Получение заказов
-- Запрос к Youdo Mobile API (`api.youdo.com/v110/tasks/tasks`) — категория IT/Software Development (Category=4194304)
-- Радиус 50км от Москвы, 50 заказов на страницу
-- Replay захваченной сигнатуры (HMAC-SHA256, KeyVersion=1) — сигнатура детерминирована, не содержит timestamp/nonce, работает бессрочно
-- Без авторизации: публичные данные о заказах доступны через мобильный API
+1. **Multi-query fetch** — calls Youdo mobile API (`v110/tasks/tasks`) with multiple frozen URL+signature pairs:
+   - General IT listing (Category=4194304, 50 tasks per page)
+   - Targeted search queries: `q=ии`, `q=AI`, `q=Ии`, `q=aeo`, `q=AEO`
+2. **Deduplication** — by task ID across all queries
+3. **AI keyword filter** — deterministic regex matching (long + short keywords with Cyrillic word boundaries)
+4. **Description fetch** — Youdo listing API returns `Description: ""` (empty). Full description is fetched via Firecrawl rotator (`127.0.0.1:9123`) scraping `youdo.com/t<id>` and extracting the «Нужно» section from rendered markdown.
+5. **Telegram notification** — HTML-formatted post with title, description, price, date, client name, and inline «Написать отклик» button
+6. **JSONL cache** — all orders saved for cover letter bot
 
-### AI-фильтрация
-- **35+ длинных ключевых слов** (substring match): искусственный интеллект, нейросеть, chatgpt, openai, machine learning, n8n, automation, langchain, RAG, LLM и др.
-- **18 коротких ключевых слов** (word boundary): ИИ, AI, ML, бот, agent, prompt, промт, copilot и др.
-- Word boundary для кириллицы через lookarounds (Python `\b` не работает с кириллицей)
-- Проверка по title + description каждого заказа
+## API signatures
 
-### Дедупликация
-- `seen_ids.json` — список ID обработанных заказов (max 1000, ring buffer)
-- Только новые заказы проходят в уведомления
-- JSONL-лог всех найденных AI-заказов (`youdo_orders.jsonl`)
+Youdo API uses HMAC-SHA256 signatures (`KeyVersion: 1`). The signature is **per-URL** — computed over the exact URL (path + query string including `SearchRequestId`, `lat`, `lng`, `Category`, `q`, `priceMin`, `page`, `pageSize`). Changing any parameter invalidates the signature.
 
-### Telegram-уведомления
-- HTML-форматирование: название, описание (до 300 символов), цена, дата, локация, автор, ссылка
-- Flood control: truncation до 4000 символов (лимит Telegram 4096)
-- Error alerts с cooldown (1 час) — не спамит при падении API
+Each `(url, signature)` pair is **frozen** — works indefinitely for that exact URL. New search queries require a new Proxyman HAR capture from the iOS app.
 
-### Надёжность
-- Чистый deterministic pipeline — без LLM, без браузера, без Playwright
-- Error alert cooldown: повторные алерты об одной ошибке не чаще раза в час
-- Graceful degradation: при ошибке API → alert в Telegram, при отсутствии новых заказов → тихий выход
-- Логирование: structured logging в stderr, JSONL-лог заказов
+### Verified search queries (2026-07-31)
 
-## Технологии
+| Query | Category | Total | Signature (first 20 chars) |
+|---|---|---|---|
+| `ии` (all categories) | Cat=1 | 26 | `79Oq4vy7/24HCbr7Xds0...` |
+| `AI` | Cat=4194304 IT | 3 | `YfNfdfOLb9uPPY6aZ...` |
+| `Ии` | Cat=4194304 IT | 3 | `jV9hZpGAKfVIJiUM...` |
+| `aeo` | Cat=1 all | 1 | `ItWH80cBsl/Xkj9h...` |
+| `AEO` | Cat=4194304 IT | 1 | `JSb/70Ykz/Zv5e9Q...` |
 
-| Технология | Назначение |
-|---|---|
-| **Python 3.10+** | Основной язык |
-| **requests** | HTTP-запросы к Youdo Mobile API и Telegram Bot API |
-| **python-dotenv** | Загрузка переменных окружения (`.env`) |
+Queries with 0 results (no active tasks): `CrewAi`, `LangGraph`, `N8n`, `RAG`, `LLM`, `Нейросеть`, `Искусственный интеллект`.
 
-## Архитектура
+## Headers
 
-Pipeline выполняется за один проход — без цикла, без состояния между запусками. Предназначен для запуска по cron каждые 5 минут.
-
-```
-youdo_check.py  (точка входа)
-
-┌─────────────────────────────────────────────────────────────┐
-│  Step 1: fetch_tasks()                                       │
-│  ├── GET api.youdo.com/v110/tasks/tasks                      │
-│  │   ├── Category=4194304 (IT/Software Development)          │
-│  │   ├── lat=55.75, lng=37.62, radius=50km (Moscow)          │
-│  │   ├── Signature: replay captured HMAC-SHA256 (KeyVer=1)   │
-│  │   └── User-Agent: iOS app (iPhone16_2)                    │
-│  └── → ResultObject.Items[] (up to 50 tasks)                 │
-│                                                              │
-│  Step 2: Filter AI orders                                    │
-│  ├── For each task: skip if Id in seen_ids                   │
-│  ├── is_ai_match(Name + Description)                         │
-│  │   ├── AI_RE_LONG: 35+ long keywords (substring)           │
-│  │   └── AI_RE_SHORT: 18 short keywords (word boundary)      │
-│  └── → new_ai_orders list                                    │
-│                                                              │
-│  Step 3: Send & Log                                          │
-│  ├── format_task_message() → HTML with price, date, link     │
-│  ├── send_telegram() → Bot API (truncation at 4000 chars)    │
-│  ├── append_jsonl() → youdo_orders.jsonl (full record)       │
-│  ├── Update seen_ids (append, trim to 1000)                  │
-│  └── save_seen_ids()                                         │
-└─────────────────────────────────────────────────────────────┘
+```http
+Host: api.youdo.com
+X-AdvId: 837262DA-8F62-4D19-AF65-31C99119BED7
+KeyVersion: 1
+X-FeatureSetId: 976
+Signature: <per-URL HMAC-SHA256>
+X-VisitorId: E38D2FBB-515B-4B6D-AD76-665B0027C70A
+X-DeviceId: E38D2FBB-515B-4B6D-AD76-665B0027C70A
+User-Agent: 26.5.2,4.226.0.3030102,iosPhoneApp,430x932,3,apple,iPhone16_2,E38D2FBB-515B-4B6D-AD76-665B0027C70A
+msid: 6ccec869-4690-46b4-ad77-dcd41861f9cd
 ```
 
-### Ключевая деталь: Replay сигнатуры
+## Description fetch (Firecrawl)
 
-Youdo Mobile API использует HMAC-SHA256 сигнатуру для авторизации запросов. Сигнатура детерминирована — зависит только от URL и секретного ключа (зашитого в iOS-приложении), без timestamp или nonce. Это означает:
-
-- Один захваченный `Signature` работает для одного URL **бессрочно**
-- Не нужен MITM-прокси или перехват на каждый запуск
-- Не нужен логин или OAuth-токен
-
-Захват сигнатуры выполняется один раз через MITM-прокси (Charles/mitmproxy) при перехвате запроса мобильного приложения.
-
-## Требования
-
-- **Python 3.10+**
-- **Захваченная сигнатура Youdo API** (уже встроена в скрипт)
-- **Telegram bot token** — для уведомлений
-
-## Установка
-
-```bash
-# 1. Клонировать репозиторий
-git clone https://github.com/Asmadey/youdo-ai-orders-monitor.git
-cd youdo-ai-orders-monitor
-
-# 2. Создать виртуальное окружение
-python3 -m venv .venv
-source .venv/bin/activate
-
-# 3. Установить зависимости
-pip install -r requirements.txt
-
-# 4. Создать .env из примера
-cp .env.example .env
-# Заполнить TELEGRAM_BOT_TOKEN, TG_CHAT_ID
-```
-
-### Переменные окружения (`.env`)
-
-| Переменная | Описание | По умолчанию |
-|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | Токен Telegram-бота от [@BotFather](https://t.me/BotFather) | — |
-| `TG_CHAT_ID` | ID чата для уведомлений | `128204572` |
-
-## Запуск
-
-```bash
-# Разовый запуск
-python3 youdo_check.py
-
-# Cron (каждые 5 минут)
-*/5 * * * * cd /path/to/youdo-ai-orders-monitor && python3 youdo_check.py >> logs/cron.log 2>&1
-```
-
-## Конфигурация
-
-### Категория и гео
-
-Параметры запроса задаются в `YOUDO_URL` в начале скрипта:
+Youdo listing API returns `Description: ""` for all tasks. Full description is scraped from `youdo.com/t<id>` via Firecrawl rotator:
 
 ```python
-YOUDO_URL = (
-    "https://api.youdo.com/v110/tasks/tasks"
-    "?status=Opened"
-    "&Category=4194304"      # IT / Software Development
-    "&lat=55.753215"         # Moscow
-    "&lng=37.622504"
-    "&radius=50.0"           # 50 km
-    "&page=1"
-    "&pageSize=50"
-)
+resp = requests.post("http://127.0.0.1:9123/v2/scrape", json={
+    "url": f"https://youdo.com/t{task_id}",
+    "formats": ["markdown"],
+    "onlyMainContent": True,
+    "waitFor": 2000,
+}, timeout=15)
+# Extract «Нужно» section from markdown
 ```
 
-Для мониторинга другой категории измените `Category` и координаты.
+The `servicepipe.tech` JS-challenge on youdo.com blocks raw `requests.get()` — Firecrawl bypasses it via headless browser rendering.
 
-### AI-ключевые слова
-
-Два списка в начале скрипта:
-
-```python
-AI_KEYWORDS_LONG = [
-    "искусственный интеллект", "нейросет", "chatgpt", "openai",
-    "machine learning", "n8n", "automation", "langchain",
-    "retrieval augmented generation", "fine-tuning", ...
-]
-
-AI_KEYWORDS_SHORT = [
-    "ии", "ai", "ml", "бот", "bot", "agent", "агент",
-    "rag", "llm", "ocr", "nlp", "prompt", "промт", ...
-]
-```
-
-Long — substring match (уникальные слова). Short — word boundary через lookarounds (короткие слова, защита от false positives вроде «ai» в «again»).
-
-## Структура проекта
-
-| Файл | Назначение |
-|---|---|
-| `youdo_check.py` | Полный pipeline: fetch → filter → dedup → send → log |
-| `.env.example` | Шаблон переменных окружения |
-| `requirements.txt` | Python-зависимости |
-| `pyproject.toml` | Метаданные пакета, ruff config |
-
-## Runtime-артефакты
-
-Эти файлы создаются во время работы (не входят в репозиторий):
-
-| Артефакт | Назначение |
-|---|---|
-| `youdo_seen_ids.json` | Список ID обработанных заказов (ring buffer, max 1000) |
-| `youdo_orders.jsonl` | Лог всех найденных AI-заказов (по строкам JSON) |
-| `youdo_error_alerts.json` | Cooldown-стейт для error alerts (timestamp → last alert) |
-
-## Youdo Mobile API
-
-### Endpoint
+## Telegram post format
 
 ```
-GET https://api.youdo.com/v110/tasks/tasks
+#YouDo
+Создать чат бот
+
+Необходимо сделать бот с вопросами (вопросы и ответы подготовлены) в телеграм. Бот должен записывать инфу в базу и уведомлять сотрудника.
+
+💰 до 14000 ₽
+🕐 31.07 09:18
+👤 Екатерина
+
+🔗 https://youdo.com/t15031340
+[📝 Написать отклик] (inline button)
 ```
 
-### Заголовки
+## Cron
 
-| Заголовок | Назначение |
-|---|---|
-| `Signature` | HMAC-SHA256 сигнатура (replay, KeyVersion=1) |
-| `KeyVersion` | Версия ключа (`1`) |
-| `X-VisitorId` | UUID посетителя |
-| `X-DeviceId` | UUID устройства |
-| `User-Agent` | Строка iOS-приложения (версия, модель, UUID) |
-| `msid` | Session ID |
+`*/5 * * * *` — runs `youdo_cron_check.sh` which calls `youdo_check.py`.
 
-### Ответ
+## Requirements
 
-```json
-{
-  "IsSuccess": true,
-  "ResultObject": {
-    "Items": [
-      {
-        "Id": 123456,
-        "Name": "Создать чат-бота для Telegram",
-        "Description": "Нужен AI-бот...",
-        "Budget": {"Min": 5000, "Max": 30000},
-        "Location": {"Address": "Москва"},
-        "CreatorName": "Иван",
-        "CategoryName": "Разработка ПО",
-        "DatePublish": 1721629200000
-      }
-    ],
-    "TotalCount": 42
-  }
-}
-```
+- Python 3.12+, `requests`
+- Firecrawl rotator at `127.0.0.1:9123` (for description fetch)
+- Telegram bot token + chat ID
 
-## Лицензия
+## Files
+
+- `youdo_check.py` — main script: fetch, filter, dedup, Telegram, JSONL
+- `requirements.txt` — Python dependencies
+
+## License
 
 MIT
